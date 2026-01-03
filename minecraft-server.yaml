@@ -1,0 +1,224 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Minecraft Vanilla 1.21.11 Server (Auto-Fetch) - Fixed for TLauncher
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Chon KeyPair de SSH
+
+Resources:
+  # 1. SECURITY GROUP (Giữ nguyên)
+  MinecraftSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow Minecraft and SSH
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 25565
+          ToPort: 25565
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: 0.0.0.0/0 
+
+  # 2. IAM ROLE (Giữ nguyên)
+  MinecraftS3AccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                Resource:
+                  - "arn:aws:s3:::gaming-map"
+                  - "arn:aws:s3:::gaming-map/*"
+
+  MinecraftInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref MinecraftS3AccessRole
+
+  # 3. LAUNCH TEMPLATE
+  MinecraftTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        InstanceType: t3.medium
+        ImageId: ami-060e277c0d4cce553 
+        KeyName: !Ref KeyName
+        
+        InstanceMarketOptions:
+          MarketType: spot
+          SpotOptions:
+            SpotInstanceType: one-time
+            
+        SecurityGroupIds: 
+          - !GetAtt MinecraftSecurityGroup.GroupId
+          
+        IamInstanceProfile:
+          Arn: !GetAtt MinecraftInstanceProfile.Arn
+          
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              VolumeSize: 20
+              VolumeType: gp3
+              
+        # --- SCRIPT CÀI ĐẶT ---
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            
+            # 1. Cài đặt môi trường (Thêm jq để xử lý JSON tìm link tải)
+            apt-get update
+            apt-get install -y openjdk-21-jdk unzip curl zip jq
+            
+            # Cài AWS CLI
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            unzip awscliv2.zip
+            ./aws/install
+
+            # Tạo thư mục
+            mkdir -p /opt/minecraft/
+            cd /opt/minecraft/
+            
+            # 2. Tải Game (Tự động tìm link tải bản 1.21.11)
+            
+            # Restore Map cũ (Nếu có)
+            aws s3 sync s3://gaming-map/minecraft/world /opt/minecraft/world
+
+            echo "Đang tìm link tải cho phiên bản 1.21.11..."
+            
+            # Dò tìm URL từ API của Mojang
+            MANIFEST_URL="https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
+            TARGET_VERSION="1.21.11"
+            
+            # Lấy URL của file JSON phiên bản
+            VERSION_URL=$(curl -s $MANIFEST_URL | jq -r --arg VER "$TARGET_VERSION" '.versions[] | select(.id == $VER) | .url')
+            
+            if [ -z "$VERSION_URL" ] || [ "$VERSION_URL" == "null" ]; then
+                echo "ERROR: Không tìm thấy phiên bản $TARGET_VERSION trên hệ thống Mojang!"
+                # Fallback: Nếu không tìm thấy, thử tải bản mới nhất (release) để không bị crash script
+                VERSION_URL=$(curl -s $MANIFEST_URL | jq -r '.latest.release as $latest | .versions[] | select(.id == $latest) | .url')
+            fi
+
+            # Lấy link tải file server.jar
+            SERVER_DOWNLOAD_URL=$(curl -s $VERSION_URL | jq -r '.downloads.server.url')
+            
+            echo "Đang tải server.jar từ: $SERVER_DOWNLOAD_URL"
+            wget $SERVER_DOWNLOAD_URL -O server.jar
+            
+            # 3. CẤU HÌNH SERVER & SỬA LỖI TLAUNCHER
+            echo 'eula=true' > eula.txt
+            
+            # Tạo file server.properties với cấu hình tắt check bản quyền
+            if [ -f server.properties ]; then
+                # Nếu file đã có (do restore map), dùng sed để sửa dòng online-mode
+                if grep -q "online-mode" server.properties; then
+                    sed -i 's/online-mode=true/online-mode=false/g' server.properties
+                else
+                    echo "online-mode=false" >> server.properties
+                fi
+            else
+                # Nếu chưa có, tạo mới
+                echo "online-mode=false" > server.properties
+                echo "difficulty=normal" >> server.properties
+                echo "motd=Server Vanila 1.21.11" >> server.properties
+            fi
+            
+            # Tạo file khởi động
+            echo 'java -Xmx3G -Xms1G -jar server.jar nogui' > start.sh
+            chmod +x start.sh
+
+            # 4. Tạo các script backup
+            
+            # Restore script
+            cat <<EOF > restore_map.sh
+            #!/bin/bash
+            aws s3 sync s3://gaming-map/minecraft/world /opt/minecraft/world
+            EOF
+
+            # Backup script
+            cat <<EOF > backup_map.sh
+            #!/bin/bash
+            aws s3 sync /opt/minecraft/world s3://gaming-map/minecraft/world --delete
+            EOF
+            
+            # Spot Monitor script
+            cat <<EOF > spot-monitor.sh
+            #!/bin/bash
+            while true; do
+              TOKEN=\$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+              HTTP_CODE=\$(curl -H "X-aws-ec2-metadata-token: \$TOKEN" -s -o /dev/null -w "%{http_code}" http://169.254.169.254/latest/meta-data/spot/instance-action)
+              if [ "\$HTTP_CODE" -eq 200 ]; then
+                su - ubuntu -c "/bin/bash /opt/minecraft/backup_map.sh"
+                break
+              fi
+              sleep 5
+            done
+            EOF
+
+            # 5. BÀN GIAO QUYỀN HẠN
+            chmod +x *.sh
+            chown -R ubuntu:ubuntu /opt/minecraft
+
+            # 6. Cấu hình Service & Cron
+            
+            # Monitor Spot Instance
+            nohup ./spot-monitor.sh &
+
+            # Service Backup
+            cat <<EOF > /etc/systemd/system/minecraft-backup.service
+            [Unit]
+            Description=Backup on Shutdown
+            DefaultDependencies=no
+            Before=shutdown.target reboot.target halt.target
+            [Service]
+            Type=oneshot
+            User=ubuntu
+            ExecStop=/bin/bash /opt/minecraft/backup_map.sh
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+            
+            systemctl enable minecraft-backup.service
+            systemctl start minecraft-backup.service
+            
+            # Cronjob backup mỗi 15 phút
+            su - ubuntu -c "(crontab -l 2>/dev/null; echo '*/15 * * * * /opt/minecraft/backup_map.sh') | crontab -"
+
+            # 7. KHỞI ĐỘNG SERVER
+            su - ubuntu -c "cd /opt/minecraft && nohup ./start.sh > mc-server.log 2>&1 &"
+
+  # 4. MÁY CHỦ INSTANCE
+  MinecraftInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref MinecraftTemplate
+        Version: !GetAtt MinecraftTemplate.LatestVersionNumber
+
+Outputs:
+  InstancePublicIP:
+    Description: Public IP
+    Value: !GetAtt MinecraftInstance.PublicIp
